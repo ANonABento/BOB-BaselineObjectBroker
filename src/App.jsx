@@ -29,6 +29,7 @@ function App() {
   const [newObjectPoints, setNewObjectPoints] = useState([]); // For manual object creation
   const [nextObjectId, setNextObjectId] = useState(1);
   const [mousePosition, setMousePosition] = useState(null); // For polygon builder preview
+  const [detectionStats, setDetectionStats] = useState(null); // Store detection info
 
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
@@ -56,34 +57,28 @@ function App() {
           const detectedObjects = await detectContours(dataUrl);
           console.log('Contour detection completed, found', detectedObjects.length, 'objects');
           
-          // Auto-name objects (coins don't count toward object numbering)
-          let objectCounter = 1;
-          const namedObjects = detectedObjects.map((obj) => {
-            if (obj.isCoin) {
-              return {
-                ...obj,
-                name: 'Coin',
-                color: '#F59E0B'
-              };
-            } else {
-              const name = `Object ${objectCounter}`;
-              const color = COLORS[(objectCounter - 1) % COLORS.length];
-              objectCounter++;
-              return {
-                ...obj,
-                name,
-                color
-              };
-            }
+          setDetectionStats({
+            totalFound: detectedObjects.length,
+            coins: detectedObjects.filter(o => o.isCoin).length,
+            objects: detectedObjects.filter(o => !o.isCoin).length
           });
           
+          // Objects already have unique IDs from detectContours
           // Apply PPM if already calibrated
           const finalObjects = ppm 
-            ? namedObjects.map(obj => applyPPMToObject(obj, ppm))
-            : namedObjects;
+            ? detectedObjects.map(obj => applyPPMToObject(obj, ppm))
+            : detectedObjects;
           
           setObjects(finalObjects);
-          setNextObjectId(objectCounter);
+          
+          // Set nextObjectId based on non-coin objects
+          const maxObjectNum = detectedObjects
+            .filter(obj => !obj.isCoin)
+            .reduce((max, obj) => {
+              const match = obj.name.match(/Object (\d+)/);
+              return match ? Math.max(max, parseInt(match[1])) : max;
+            }, 0);
+          setNextObjectId(maxObjectNum + 1);
         } catch (error) {
           console.error('Detection failed:', error);
           alert('Failed to detect objects. Please try another image.\n\nError: ' + (error.message || error.toString()));
@@ -105,29 +100,39 @@ function App() {
       const pixelDistance = await detectCoin(imageSrc);
       const calculatedPpm = calculatePPM(pixelDistance);
       setPpm(calculatedPpm);
-      setCoinDiameter(pixelDistance); // Store coin diameter in pixels
+      setCoinDiameter(pixelDistance);
       
-      // Apply PPM to all objects
-      setObjects(prevObjects => 
-        prevObjects.map(obj => {
-          if (obj.isCoin) {
-            return {
-              ...obj,
-              pixelDistance,
-              measurements: {
-                ...obj.measurements,
-                perimeter: COIN_DIAMETER_MM * Math.PI
-              }
-            };
-          }
-          return applyPPMToObject(obj, calculatedPpm);
-        })
-      );
+      // Create or update coin object
+      const coinObject = {
+        id: `coin_${Date.now()}`,
+        name: 'Coin (Reference)',
+        color: '#F59E0B',
+        contour: { x: 0, y: 0, width: pixelDistance, height: pixelDistance },
+        points: [],
+        edges: [],
+        area: Math.PI * (pixelDistance / 2) ** 2,
+        perimeter: COIN_DIAMETER_MM * Math.PI,
+        isCoin: true,
+        circularity: 1.0,
+        pixelDistance,
+        measurements: {
+          edges: [],
+          perimeter: COIN_DIAMETER_MM * Math.PI,
+          diameter: COIN_DIAMETER_MM
+        }
+      };
+      
+      // Apply PPM to all existing objects and add coin
+      setObjects(prevObjects => {
+        const nonCoins = prevObjects.filter(obj => !obj.isCoin);
+        const calibratedObjects = nonCoins.map(obj => applyPPMToObject(obj, calculatedPpm));
+        return [coinObject, ...calibratedObjects];
+      });
       
       setMode('select');
     } catch (error) {
       console.error('Auto calibration failed:', error);
-      alert('Failed to detect coin automatically. Try manual calibration.');
+      alert('Failed to detect coin automatically.\n\nTips:\n• Use a plain, contrasting background\n• Ensure good lighting without harsh shadows\n• Make sure the coin is fully visible\n• Try manual calibration instead');
     } finally {
       setIsProcessing(false);
     }
@@ -166,24 +171,34 @@ function App() {
         const pixelDistance = calculatePixelDistance(newPoints[0], newPoints[1]);
         const calculatedPpm = calculatePPM(pixelDistance);
         setPpm(calculatedPpm);
-        setCoinDiameter(pixelDistance); // Store coin diameter in pixels
+        setCoinDiameter(pixelDistance);
         
-        // Apply PPM to all objects
-        setObjects(prevObjects => 
-          prevObjects.map(obj => {
-            if (obj.isCoin) {
-              return {
-                ...obj,
-                pixelDistance,
-                measurements: {
-                  ...obj.measurements,
-                  perimeter: COIN_DIAMETER_MM * Math.PI
-                }
-              };
-            }
-            return applyPPMToObject(obj, calculatedPpm);
-          })
-        );
+        // Create coin object for manual calibration
+        const coinObject = {
+          id: `coin_${Date.now()}`,
+          name: 'Coin (Reference)',
+          color: '#F59E0B',
+          contour: { x: 0, y: 0, width: pixelDistance, height: pixelDistance },
+          points: [],
+          edges: [],
+          area: Math.PI * (pixelDistance / 2) ** 2,
+          perimeter: COIN_DIAMETER_MM * Math.PI,
+          isCoin: true,
+          circularity: 1.0,
+          pixelDistance,
+          measurements: {
+            edges: [],
+            perimeter: COIN_DIAMETER_MM * Math.PI,
+            diameter: COIN_DIAMETER_MM
+          }
+        };
+        
+        // Apply PPM to all existing objects and add coin
+        setObjects(prevObjects => {
+          const nonCoins = prevObjects.filter(obj => !obj.isCoin);
+          const calibratedObjects = nonCoins.map(obj => applyPPMToObject(obj, calculatedPpm));
+          return [coinObject, ...calibratedObjects];
+        });
         
         setCoinPoints([]);
         setMode('select');
@@ -268,7 +283,7 @@ function App() {
     const nextObjectNumber = nonCoinObjects.length + 1;
     
     const newObject = {
-      id: nextObjectId,
+      id: `manual_${Date.now()}_${nextObjectId}`, // Unique ID
       name: `Object ${nextObjectNumber}`,
       color: COLORS[(nextObjectNumber - 1) % COLORS.length],
       contour: {
@@ -420,7 +435,7 @@ function App() {
             
             // Build text with mm preferred, px as fallback
             let text;
-            if (edge.realLength !== null && edge.realLength !== undefined) {
+            if (ppm && edge.realLength !== null && edge.realLength !== undefined) {
               text = `E${idx + 1}: ${edge.realLength.toFixed(1)}mm`;
             } else {
               text = `E${idx + 1}: ${edge.pixelLength.toFixed(1)}px`;
@@ -730,19 +745,25 @@ function App() {
                 </div>
 
                 {ppm && (
-                  <div className="mt-2 text-green-400">
-                    <div>Calibration: {ppm.toFixed(2)} pixels/mm</div>
+                  <div className="mt-2 px-4 py-2 bg-green-900/50 border border-green-700 rounded-lg text-green-400">
+                    <div className="font-semibold">✓ Calibrated</div>
+                    <div className="text-sm mt-1">
+                      {ppm.toFixed(2)} pixels/mm
+                    </div>
                     {coinDiameter && (
-                      <div className="text-sm mt-1">
-                        Coin Diameter: {coinDiameter.toFixed(1)}px ({COIN_DIAMETER_MM}mm)
+                      <div className="text-xs mt-1 text-green-300">
+                        Coin: {coinDiameter.toFixed(1)}px = {COIN_DIAMETER_MM}mm
                       </div>
                     )}
                   </div>
                 )}
 
                 {isProcessing && (
-                  <div className="mt-2 text-blue-400">
-                    Processing image...
+                  <div className="mt-2 px-4 py-2 bg-blue-900/50 border border-blue-700 rounded-lg text-blue-400">
+                    <div className="flex items-center gap-2">
+                      <div className="animate-spin h-4 w-4 border-2 border-blue-400 border-t-transparent rounded-full"></div>
+                      <span>Processing image...</span>
+                    </div>
                   </div>
                 )}
               </>
@@ -757,7 +778,7 @@ function App() {
           {objects.length === 0 ? (
             <p className="text-gray-400">No objects detected yet. Upload an image to begin.</p>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-2">
               {objects.map(obj => (
                 <div
                   key={obj.id}
@@ -771,29 +792,32 @@ function App() {
                   <div className="flex items-center justify-between gap-2 mb-2">
                     <div className="flex items-center gap-2">
                       <div
-                        className="w-4 h-4 rounded"
+                        className="w-4 h-4 rounded flex-shrink-0"
                         style={{ backgroundColor: obj.color }}
                       />
-                      <span className="font-semibold">{obj.name}</span>
+                      <span className="font-semibold text-sm">{obj.name}</span>
                     </div>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
                         handleDeleteObject(obj.id);
                       }}
-                      className="text-red-400 hover:text-red-300 text-sm px-2 py-1"
+                      className="text-red-400 hover:text-red-300 text-lg px-2 py-0 leading-none"
                       title="Delete object"
                     >
                       ×
                     </button>
                   </div>
-                  {obj.edges && obj.edges.length > 0 ? (
-                    <div className="text-sm text-gray-300">
-                      {obj.edges.length} edge{obj.edges.length !== 1 ? 's' : ''}
-                    </div>
-                  ) : (
-                    <div className="text-sm text-gray-500">No edges</div>
-                  )}
+                  <div className="text-xs text-gray-400">
+                    {obj.edges && obj.edges.length > 0 ? (
+                      <span>{obj.edges.length} edge{obj.edges.length !== 1 ? 's' : ''}</span>
+                    ) : (
+                      <span>No edges</span>
+                    )}
+                    {obj.circularity && (
+                      <span className="ml-2">• Circ: {obj.circularity.toFixed(2)}</span>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -834,10 +858,10 @@ function App() {
                           <div className="flex justify-between items-center">
                             <span>Edge {idx + 1}:</span>
                             <span className="font-mono text-right">
-                              {edge.realLength !== null && edge.realLength !== undefined ? (
+                              {ppm && edge.realLength !== null && edge.realLength !== undefined ? (
                                 <span>
                                   <span className="text-green-400">{edge.realLength.toFixed(1)}mm</span>
-                                  <span className="text-gray-400 ml-2">({edge.pixelLength.toFixed(1)}px)</span>
+                                  <span className="text-gray-400 text-xs ml-1">({edge.pixelLength.toFixed(0)}px)</span>
                                 </span>
                               ) : (
                                 <span>{edge.pixelLength.toFixed(1)}px</span>
@@ -850,6 +874,15 @@ function App() {
                   </div>
                 )}
 
+                {selectedObject.measurements?.diameter && (
+                  <div className="mt-2 p-2 bg-yellow-900/30 border border-yellow-700 rounded text-sm">
+                    <div className="text-yellow-400 font-semibold">Reference Coin</div>
+                    <div className="text-yellow-300 text-xs mt-1">
+                      Diameter: {selectedObject.measurements.diameter}mm
+                    </div>
+                  </div>
+                )}
+
                 <button
                   onClick={() => handleDeleteObject(selectedObject.id)}
                   className="w-full mt-3 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition text-white font-medium"
@@ -858,7 +891,7 @@ function App() {
                 </button>
 
                 {!ppm && (
-                  <div className="text-yellow-400 text-sm">
+                  <div className="text-yellow-400 text-sm mt-2">
                     Tip: Calibrate using the coin to enable real-world measurements
                   </div>
                 )}
@@ -867,7 +900,7 @@ function App() {
           )}
         </div>
       </div>
-      </div>
+    </div>
   );
 }
 
