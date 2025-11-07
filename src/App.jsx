@@ -18,6 +18,7 @@ function App() {
   // State management
   const [mode, setMode] = useState('select'); // 'select', 'auto_coin', 'manual_coin', 'create_object'
   const [ppm, setPpm] = useState(null);
+  const [coinDiameter, setCoinDiameter] = useState(null); // Store coin diameter in pixels
   const [imageSrc, setImageSrc] = useState(null);
   const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 });
   const [objects, setObjects] = useState([]);
@@ -27,6 +28,7 @@ function App() {
   const [canvasScale, setCanvasScale] = useState(1);
   const [newObjectPoints, setNewObjectPoints] = useState([]); // For manual object creation
   const [nextObjectId, setNextObjectId] = useState(1);
+  const [mousePosition, setMousePosition] = useState(null); // For polygon builder preview
 
   const canvasRef = useRef(null);
   const imageRef = useRef(null);
@@ -50,7 +52,10 @@ function App() {
         // Real contour detection with OpenCV
         setIsProcessing(true);
         try {
+          console.log('Starting contour detection...');
           const detectedObjects = await detectContours(dataUrl);
+          console.log('Contour detection completed, found', detectedObjects.length, 'objects');
+          
           // Auto-name objects (coins don't count toward object numbering)
           let objectCounter = 1;
           const namedObjects = detectedObjects.map((obj) => {
@@ -81,7 +86,7 @@ function App() {
           setNextObjectId(objectCounter);
         } catch (error) {
           console.error('Detection failed:', error);
-          alert('Failed to detect objects. Please try another image. Error: ' + error.message);
+          alert('Failed to detect objects. Please try another image.\n\nError: ' + (error.message || error.toString()));
         } finally {
           setIsProcessing(false);
         }
@@ -100,6 +105,7 @@ function App() {
       const pixelDistance = await detectCoin(imageSrc);
       const calculatedPpm = calculatePPM(pixelDistance);
       setPpm(calculatedPpm);
+      setCoinDiameter(pixelDistance); // Store coin diameter in pixels
       
       // Apply PPM to all objects
       setObjects(prevObjects => 
@@ -160,6 +166,7 @@ function App() {
         const pixelDistance = calculatePixelDistance(newPoints[0], newPoints[1]);
         const calculatedPpm = calculatePPM(pixelDistance);
         setPpm(calculatedPpm);
+        setCoinDiameter(pixelDistance); // Store coin diameter in pixels
         
         // Apply PPM to all objects
         setObjects(prevObjects => 
@@ -326,6 +333,16 @@ function App() {
     );
   };
 
+  // Delete object
+  const handleDeleteObject = (id) => {
+    if (window.confirm('Are you sure you want to delete this object?')) {
+      setObjects(prevObjects => prevObjects.filter(obj => obj.id !== id));
+      if (selectedObjectId === id) {
+        setSelectedObjectId(null);
+      }
+    }
+  };
+
   // Apply PPM to all objects when PPM changes
   useEffect(() => {
     if (ppm && objects.length > 0) {
@@ -390,30 +407,42 @@ function App() {
           ctx.fill();
         });
 
-        // Draw edge measurements if PPM is set
-        if (ppm && obj.edges) {
+        // Draw edge measurements and labels
+        if (obj.edges) {
           obj.edges.forEach((edge, idx) => {
-            if (edge.realLength) {
-              const midX = ((edge.start.x + edge.end.x) / 2) * scale;
-              const midY = ((edge.start.y + edge.end.y) / 2) * scale;
-              
-              ctx.fillStyle = '#FFFFFF';
-              ctx.strokeStyle = '#000000';
-              ctx.lineWidth = 3;
-              ctx.font = 'bold 11px sans-serif';
-              const text = `${edge.realLength.toFixed(1)}mm`;
-              const metrics = ctx.measureText(text);
-              const textWidth = metrics.width;
-              const textHeight = 12;
-              
-              // Draw text background
-              ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-              ctx.fillRect(midX - textWidth / 2 - 3, midY - textHeight - 3, textWidth + 6, textHeight + 6);
-              
-              // Draw text
-              ctx.fillStyle = '#FFFFFF';
-              ctx.fillText(text, midX - textWidth / 2, midY - 2);
+            const midX = ((edge.start.x + edge.end.x) / 2) * scale;
+            const midY = ((edge.start.y + edge.end.y) / 2) * scale;
+            
+            // Calculate angle for label positioning
+            const dx = edge.end.x - edge.start.x;
+            const dy = edge.end.y - edge.start.y;
+            const angle = Math.atan2(dy, dx);
+            
+            // Build text with mm preferred, px as fallback
+            let text;
+            if (edge.realLength !== null && edge.realLength !== undefined) {
+              text = `E${idx + 1}: ${edge.realLength.toFixed(1)}mm`;
+            } else {
+              text = `E${idx + 1}: ${edge.pixelLength.toFixed(1)}px`;
             }
+            
+            ctx.font = 'bold 10px sans-serif';
+            const metrics = ctx.measureText(text);
+            const textWidth = metrics.width;
+            const textHeight = 12;
+            
+            // Offset label perpendicular to edge
+            const offset = 15;
+            const labelX = midX + Math.cos(angle + Math.PI / 2) * offset;
+            const labelY = midY + Math.sin(angle + Math.PI / 2) * offset;
+            
+            // Draw text background
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+            ctx.fillRect(labelX - textWidth / 2 - 3, labelY - textHeight - 3, textWidth + 6, textHeight + 6);
+            
+            // Draw text
+            ctx.fillStyle = '#FFFFFF';
+            ctx.fillText(text, labelX - textWidth / 2, labelY - 2);
           });
         }
 
@@ -433,31 +462,35 @@ function App() {
         ctx.strokeRect(x * scale, y * scale, width * scale, height * scale);
       }
 
-      // Draw label
-      const labelX = obj.contour.x * scale + 5;
-      const labelY = obj.contour.y * scale + 20;
-      
-      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-      ctx.fillRect(labelX - 3, labelY - 14, ctx.measureText(obj.name).width + 6, 18);
-      
-      ctx.fillStyle = obj.color;
-      ctx.font = 'bold 14px sans-serif';
-      ctx.fillText(obj.name, labelX, labelY);
-
-      // Draw perimeter measurement if available
-      if (obj.measurements && obj.measurements.perimeter) {
-        const perimeterText = `Perimeter: ${obj.measurements.perimeter.toFixed(1)}mm`;
-        const perimeterX = obj.contour.x * scale + 5;
-        const perimeterY = (obj.contour.y + obj.contour.height) * scale - 5;
-        
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-        const pMetrics = ctx.measureText(perimeterText);
-        ctx.fillRect(perimeterX - 3, perimeterY - 12, pMetrics.width + 6, 16);
-        
-        ctx.fillStyle = '#FFFFFF';
-        ctx.font = '12px sans-serif';
-        ctx.fillText(perimeterText, perimeterX, perimeterY);
+      // Draw label in center of object
+      let centerX, centerY;
+      if (obj.points && obj.points.length > 0) {
+        // Calculate centroid of polygon
+        let sumX = 0, sumY = 0;
+        obj.points.forEach(p => {
+          sumX += p.x;
+          sumY += p.y;
+        });
+        centerX = (sumX / obj.points.length) * scale;
+        centerY = (sumY / obj.points.length) * scale;
+      } else {
+        // Use center of bounding box
+        centerX = (obj.contour.x + obj.contour.width / 2) * scale;
+        centerY = (obj.contour.y + obj.contour.height / 2) * scale;
       }
+      
+      ctx.font = 'bold 14px sans-serif';
+      const nameMetrics = ctx.measureText(obj.name);
+      const nameWidth = nameMetrics.width;
+      const nameHeight = 16;
+      
+      // Draw text background
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+      ctx.fillRect(centerX - nameWidth / 2 - 4, centerY - nameHeight / 2 - 2, nameWidth + 8, nameHeight + 4);
+      
+      // Draw text
+      ctx.fillStyle = obj.color;
+      ctx.fillText(obj.name, centerX - nameWidth / 2, centerY + 5);
     });
 
     // Draw manual coin calibration line
@@ -501,20 +534,36 @@ function App() {
 
     // Draw new object points being created
     if (mode === 'create_object' && newObjectPoints.length > 0) {
-      ctx.strokeStyle = '#00FF00';
-      ctx.lineWidth = 2;
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
+      // Draw solid lines for completed segments
+      if (newObjectPoints.length > 1) {
+        ctx.strokeStyle = '#00FF00';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(newObjectPoints[0].x * scale, newObjectPoints[0].y * scale);
+        for (let i = 1; i < newObjectPoints.length; i++) {
+          ctx.lineTo(newObjectPoints[i].x * scale, newObjectPoints[i].y * scale);
+        }
+        ctx.stroke();
+      }
       
+      // Draw dotted line from last point to mouse position
+      if (mousePosition) {
+        const lastPoint = newObjectPoints[newObjectPoints.length - 1];
+        ctx.strokeStyle = '#00FF00';
+        ctx.lineWidth = 2;
+        ctx.setLineDash([5, 5]);
+        ctx.beginPath();
+        ctx.moveTo(lastPoint.x * scale, lastPoint.y * scale);
+        ctx.lineTo(mousePosition.x * scale, mousePosition.y * scale);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      
+      // Draw all points
       newObjectPoints.forEach((point, index) => {
         const x = point.x * scale;
         const y = point.y * scale;
-        
-        if (index === 0) {
-          ctx.moveTo(x, y);
-        } else {
-          ctx.lineTo(x, y);
-        }
         
         // Draw point
         ctx.fillStyle = '#00FF00';
@@ -524,21 +573,9 @@ function App() {
         ctx.strokeStyle = '#FFFFFF';
         ctx.lineWidth = 1;
         ctx.stroke();
-        ctx.strokeStyle = '#00FF00';
-        ctx.lineWidth = 2;
       });
-      
-      // Draw line back to first point if more than 2 points
-      if (newObjectPoints.length > 2) {
-        const firstPoint = newObjectPoints[0];
-        const lastPoint = newObjectPoints[newObjectPoints.length - 1];
-        ctx.lineTo(firstPoint.x * scale, firstPoint.y * scale);
-      }
-      
-      ctx.stroke();
-      ctx.setLineDash([]);
     }
-  }, [imageSrc, objects, selectedObjectId, coinPoints, mode, canvasScale, newObjectPoints, ppm]);
+  }, [imageSrc, objects, selectedObjectId, coinPoints, mode, canvasScale, newObjectPoints, ppm, mousePosition]);
 
   const selectedObject = objects.find(obj => obj.id === selectedObjectId);
 
@@ -655,6 +692,26 @@ function App() {
                   <canvas
                     ref={canvasRef}
                     onClick={handleCanvasClick}
+                    onMouseMove={(e) => {
+                      if (mode === 'create_object' && imageRef.current) {
+                        const canvas = canvasRef.current;
+                        const rect = canvas.getBoundingClientRect();
+                        const img = imageRef.current;
+                        const maxWidth = 1200;
+                        const maxHeight = 800;
+                        const imageScale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+                        const scaleX = canvas.width / rect.width;
+                        const scaleY = canvas.height / rect.height;
+                        const canvasX = (e.clientX - rect.left) * scaleX;
+                        const canvasY = (e.clientY - rect.top) * scaleY;
+                        const x = canvasX / imageScale;
+                        const y = canvasY / imageScale;
+                        setMousePosition({ x, y });
+                      } else {
+                        setMousePosition(null);
+                      }
+                    }}
+                    onMouseLeave={() => setMousePosition(null)}
                     className={`bg-gray-900 ${
                       mode === 'manual_coin' || mode === 'create_object' ? 'cursor-crosshair' : 
                       mode === 'select' ? 'cursor-pointer' : 
@@ -674,7 +731,12 @@ function App() {
 
                 {ppm && (
                   <div className="mt-2 text-green-400">
-                    Calibration: {ppm.toFixed(2)} pixels/mm (Coin: 26.5mm)
+                    <div>Calibration: {ppm.toFixed(2)} pixels/mm</div>
+                    {coinDiameter && (
+                      <div className="text-sm mt-1">
+                        Coin Diameter: {coinDiameter.toFixed(1)}px ({COIN_DIAMETER_MM}mm)
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -706,19 +768,31 @@ function App() {
                       : 'border-gray-700 hover:border-gray-600'
                   }`}
                 >
-                  <div className="flex items-center gap-2 mb-2">
-                    <div
-                      className="w-4 h-4 rounded"
-                      style={{ backgroundColor: obj.color }}
-                    />
-                    <span className="font-semibold">{obj.name}</span>
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <div className="flex items-center gap-2">
+                      <div
+                        className="w-4 h-4 rounded"
+                        style={{ backgroundColor: obj.color }}
+                      />
+                      <span className="font-semibold">{obj.name}</span>
+                    </div>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDeleteObject(obj.id);
+                      }}
+                      className="text-red-400 hover:text-red-300 text-sm px-2 py-1"
+                      title="Delete object"
+                    >
+                      ×
+                    </button>
                   </div>
-                  {obj.measurements && obj.measurements.perimeter ? (
+                  {obj.edges && obj.edges.length > 0 ? (
                     <div className="text-sm text-gray-300">
-                      Perimeter: {obj.measurements.perimeter.toFixed(1)}mm
+                      {obj.edges.length} edge{obj.edges.length !== 1 ? 's' : ''}
                     </div>
                   ) : (
-                    <div className="text-sm text-gray-500">No measurements</div>
+                    <div className="text-sm text-gray-500">No edges</div>
                   )}
                 </div>
               ))}
@@ -752,17 +826,22 @@ function App() {
                 </div>
 
                 {selectedObject.edges && selectedObject.edges.length > 0 && (
-      <div>
+                  <div>
                     <label className="block text-sm font-medium mb-2">Edge Measurements</label>
                     <div className="space-y-1 max-h-40 overflow-y-auto">
                       {selectedObject.edges.map((edge, idx) => (
                         <div key={idx} className="text-sm bg-gray-600 p-2 rounded">
-                          <div className="flex justify-between">
+                          <div className="flex justify-between items-center">
                             <span>Edge {idx + 1}:</span>
-                            <span className="font-mono">
-                              {edge.realLength !== null 
-                                ? `${edge.realLength.toFixed(2)}mm` 
-                                : `${edge.pixelLength.toFixed(1)}px`}
+                            <span className="font-mono text-right">
+                              {edge.realLength !== null && edge.realLength !== undefined ? (
+                                <span>
+                                  <span className="text-green-400">{edge.realLength.toFixed(1)}mm</span>
+                                  <span className="text-gray-400 ml-2">({edge.pixelLength.toFixed(1)}px)</span>
+                                </span>
+                              ) : (
+                                <span>{edge.pixelLength.toFixed(1)}px</span>
+                              )}
                             </span>
                           </div>
                         </div>
@@ -771,11 +850,12 @@ function App() {
                   </div>
                 )}
 
-                {selectedObject.measurements && selectedObject.measurements.perimeter && (
-                  <div className="text-sm text-green-400 bg-gray-600 p-2 rounded">
-                    Total Perimeter: {selectedObject.measurements.perimeter.toFixed(2)}mm
-                  </div>
-                )}
+                <button
+                  onClick={() => handleDeleteObject(selectedObject.id)}
+                  className="w-full mt-3 px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg transition text-white font-medium"
+                >
+                  Delete Object
+                </button>
 
                 {!ppm && (
                   <div className="text-yellow-400 text-sm">

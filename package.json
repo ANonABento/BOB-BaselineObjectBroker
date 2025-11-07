@@ -10,7 +10,6 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@techstark/opencv-js": "^4.11.0-release.1",
     "react": "^19.1.1",
     "react-dom": "^19.1.1"
   },
