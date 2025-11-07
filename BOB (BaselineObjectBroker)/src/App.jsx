@@ -1,0 +1,794 @@
+import { useState, useRef, useEffect } from 'react';
+import { 
+  detectContours, 
+  detectCoin,
+  calculatePPM, 
+  calculatePixelDistance,
+  applyPPMToObject,
+  COIN_DIAMETER_MM
+} from './opencvUtils';
+
+// Color palette for objects
+const COLORS = [
+  '#3B82F6', '#EF4444', '#10B981', '#F59E0B', 
+  '#8B5CF6', '#EC4899', '#06B6D4', '#F97316'
+];
+
+function App() {
+  // State management
+  const [mode, setMode] = useState('select'); // 'select', 'auto_coin', 'manual_coin', 'create_object'
+  const [ppm, setPpm] = useState(null);
+  const [imageSrc, setImageSrc] = useState(null);
+  const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 });
+  const [objects, setObjects] = useState([]);
+  const [selectedObjectId, setSelectedObjectId] = useState(null);
+  const [coinPoints, setCoinPoints] = useState([]);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [canvasScale, setCanvasScale] = useState(1);
+  const [newObjectPoints, setNewObjectPoints] = useState([]); // For manual object creation
+  const [nextObjectId, setNextObjectId] = useState(1);
+
+  const canvasRef = useRef(null);
+  const imageRef = useRef(null);
+  const fileInputRef = useRef(null);
+
+  // Handle image upload
+  const handleImageUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const dataUrl = e.target.result;
+      setImageSrc(dataUrl);
+      
+      const img = new Image();
+      img.onload = async () => {
+        setImageDimensions({ width: img.width, height: img.height });
+        imageRef.current = img;
+        
+        // Real contour detection with OpenCV
+        setIsProcessing(true);
+        try {
+          const detectedObjects = await detectContours(dataUrl);
+          // Auto-name objects (coins don't count toward object numbering)
+          let objectCounter = 1;
+          const namedObjects = detectedObjects.map((obj) => {
+            if (obj.isCoin) {
+              return {
+                ...obj,
+                name: 'Coin',
+                color: '#F59E0B'
+              };
+            } else {
+              const name = `Object ${objectCounter}`;
+              const color = COLORS[(objectCounter - 1) % COLORS.length];
+              objectCounter++;
+              return {
+                ...obj,
+                name,
+                color
+              };
+            }
+          });
+          
+          // Apply PPM if already calibrated
+          const finalObjects = ppm 
+            ? namedObjects.map(obj => applyPPMToObject(obj, ppm))
+            : namedObjects;
+          
+          setObjects(finalObjects);
+          setNextObjectId(objectCounter);
+        } catch (error) {
+          console.error('Detection failed:', error);
+          alert('Failed to detect objects. Please try another image. Error: ' + error.message);
+        } finally {
+          setIsProcessing(false);
+        }
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Auto detect coin calibration
+  const handleAutoCalibrate = async () => {
+    if (!imageSrc) return;
+    
+    setIsProcessing(true);
+    try {
+      const pixelDistance = await detectCoin(imageSrc);
+      const calculatedPpm = calculatePPM(pixelDistance);
+      setPpm(calculatedPpm);
+      
+      // Apply PPM to all objects
+      setObjects(prevObjects => 
+        prevObjects.map(obj => {
+          if (obj.isCoin) {
+            return {
+              ...obj,
+              pixelDistance,
+              measurements: {
+                ...obj.measurements,
+                perimeter: COIN_DIAMETER_MM * Math.PI
+              }
+            };
+          }
+          return applyPPMToObject(obj, calculatedPpm);
+        })
+      );
+      
+      setMode('select');
+    } catch (error) {
+      console.error('Auto calibration failed:', error);
+      alert('Failed to detect coin automatically. Try manual calibration.');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  // Manual coin calibration - handle canvas clicks
+  const handleCanvasClick = (event) => {
+    if (!imageSrc || !imageRef.current) return;
+
+    const canvas = canvasRef.current;
+    const rect = canvas.getBoundingClientRect();
+    const img = imageRef.current;
+    
+    // Calculate the actual scale used to draw the image
+    const maxWidth = 1200;
+    const maxHeight = 800;
+    const imageScale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+    
+    // Calculate scale factor between displayed canvas size and actual canvas size
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    
+    // Convert click coordinates to canvas coordinates, then to image coordinates
+    const canvasX = (event.clientX - rect.left) * scaleX;
+    const canvasY = (event.clientY - rect.top) * scaleY;
+    
+    // Convert from scaled canvas coordinates to original image coordinates
+    const x = canvasX / imageScale;
+    const y = canvasY / imageScale;
+
+    if (mode === 'manual_coin') {
+      const newPoints = [...coinPoints, { x, y }];
+      setCoinPoints(newPoints);
+
+      if (newPoints.length === 2) {
+        const pixelDistance = calculatePixelDistance(newPoints[0], newPoints[1]);
+        const calculatedPpm = calculatePPM(pixelDistance);
+        setPpm(calculatedPpm);
+        
+        // Apply PPM to all objects
+        setObjects(prevObjects => 
+          prevObjects.map(obj => {
+            if (obj.isCoin) {
+              return {
+                ...obj,
+                pixelDistance,
+                measurements: {
+                  ...obj.measurements,
+                  perimeter: COIN_DIAMETER_MM * Math.PI
+                }
+              };
+            }
+            return applyPPMToObject(obj, calculatedPpm);
+          })
+        );
+        
+        setCoinPoints([]);
+        setMode('select');
+      }
+    } else if (mode === 'create_object') {
+      // Add point to new object
+      const newPoints = [...newObjectPoints, { x, y }];
+      setNewObjectPoints(newPoints);
+      
+      // If user clicks near the first point (within 10px), close the polygon
+      if (newPoints.length > 2) {
+        const firstPoint = newPoints[0];
+        const dist = calculatePixelDistance({ x, y }, firstPoint);
+        if (dist < 10) {
+          finishCreatingObject(newPoints.slice(0, -1)); // Remove the last duplicate point
+        }
+      }
+    } else if (mode === 'select') {
+      // Find clicked object by checking if point is inside contour
+      const clickedObject = objects.find(obj => {
+        if (obj.points && obj.points.length > 0) {
+          // Point-in-polygon test
+          return isPointInPolygon({ x, y }, obj.points);
+        } else {
+          // Fallback to bounding box
+          const { x: ox, y: oy, width, height } = obj.contour;
+          return x >= ox && x <= ox + width && y >= oy && y <= oy + height;
+        }
+      });
+      
+      if (clickedObject) {
+        setSelectedObjectId(clickedObject.id);
+      } else {
+        setSelectedObjectId(null);
+      }
+    }
+  };
+
+  // Finish creating a new object from points
+  const finishCreatingObject = (points) => {
+    if (points.length < 3) {
+      alert('At least 3 points are needed to create an object');
+      setNewObjectPoints([]);
+      return;
+    }
+
+    // Calculate bounding box
+    const xs = points.map(p => p.x);
+    const ys = points.map(p => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+
+    // Calculate edges
+    const edges = [];
+    let totalPerimeter = 0;
+    for (let i = 0; i < points.length; i++) {
+      const p1 = points[i];
+      const p2 = points[(i + 1) % points.length];
+      const length = calculatePixelDistance(p1, p2);
+      totalPerimeter += length;
+      edges.push({
+        start: p1,
+        end: p2,
+        pixelLength: length,
+        realLength: null
+      });
+    }
+
+    // Calculate area using shoelace formula
+    let area = 0;
+    for (let i = 0; i < points.length; i++) {
+      const j = (i + 1) % points.length;
+      area += points[i].x * points[j].y;
+      area -= points[j].x * points[i].y;
+    }
+    area = Math.abs(area) / 2;
+
+    // Calculate next object number (excluding coins)
+    const nonCoinObjects = objects.filter(obj => !obj.isCoin);
+    const nextObjectNumber = nonCoinObjects.length + 1;
+    
+    const newObject = {
+      id: nextObjectId,
+      name: `Object ${nextObjectNumber}`,
+      color: COLORS[(nextObjectNumber - 1) % COLORS.length],
+      contour: {
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY
+      },
+      points: points,
+      edges: edges,
+      area: area,
+      perimeter: totalPerimeter,
+      isCoin: false,
+      pixelDistance: null,
+      measurements: {
+        edges: edges.map(e => ({ pixelLength: e.pixelLength, realLength: null })),
+        perimeter: null
+      }
+    };
+
+    // Apply PPM if available
+    const finalObject = ppm ? applyPPMToObject(newObject, ppm) : newObject;
+
+    setObjects(prev => {
+      const updated = [...prev, finalObject];
+      return updated;
+    });
+    setNextObjectId(prev => prev + 1);
+    setNewObjectPoints([]);
+    setMode('select');
+    setSelectedObjectId(finalObject.id);
+  };
+
+  // Point-in-polygon test
+  const isPointInPolygon = (point, polygon) => {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].x, yi = polygon[i].y;
+      const xj = polygon[j].x, yj = polygon[j].y;
+      const intersect = ((yi > point.y) !== (yj > point.y)) &&
+        (point.x < (xj - xi) * (point.y - yi) / (yj - yi) + xi);
+      if (intersect) inside = !inside;
+    }
+    return inside;
+  };
+
+  // Update object name
+  const handleNameChange = (id, newName) => {
+    setObjects(prevObjects =>
+      prevObjects.map(obj =>
+        obj.id === id ? { ...obj, name: newName } : obj
+      )
+    );
+  };
+
+  // Update object color
+  const handleColorChange = (id, newColor) => {
+    setObjects(prevObjects =>
+      prevObjects.map(obj =>
+        obj.id === id ? { ...obj, color: newColor } : obj
+      )
+    );
+  };
+
+  // Apply PPM to all objects when PPM changes
+  useEffect(() => {
+    if (ppm && objects.length > 0) {
+      setObjects(prevObjects => 
+        prevObjects.map(obj => applyPPMToObject(obj, ppm))
+      );
+    }
+  }, [ppm]);
+
+  // Draw canvas with image and overlays
+  useEffect(() => {
+    if (!imageSrc || !imageRef.current) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const img = imageRef.current;
+
+    // Calculate scale to fit canvas
+    const maxWidth = 1200;
+    const maxHeight = 800;
+    const scale = Math.min(maxWidth / img.width, maxHeight / img.height, 1);
+    setCanvasScale(scale);
+
+    canvas.width = img.width * scale;
+    canvas.height = img.height * scale;
+
+    // Clear canvas
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Draw image
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    // Draw objects with actual contours
+    objects.forEach(obj => {
+      const isSelected = obj.id === selectedObjectId;
+      
+      if (obj.points && obj.points.length > 0) {
+        // Draw actual contour shape
+        ctx.beginPath();
+        const firstPoint = obj.points[0];
+        ctx.moveTo(firstPoint.x * scale, firstPoint.y * scale);
+        
+        for (let i = 1; i < obj.points.length; i++) {
+          ctx.lineTo(obj.points[i].x * scale, obj.points[i].y * scale);
+        }
+        ctx.closePath();
+
+        // Fill with semi-transparent color
+        ctx.fillStyle = obj.color + '40';
+        ctx.fill();
+
+        // Draw border
+        ctx.strokeStyle = obj.color;
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.stroke();
+
+        // Draw vertices
+        obj.points.forEach((point, idx) => {
+          ctx.fillStyle = obj.color;
+          ctx.beginPath();
+          ctx.arc(point.x * scale, point.y * scale, isSelected ? 5 : 3, 0, 2 * Math.PI);
+          ctx.fill();
+        });
+
+        // Draw edge measurements if PPM is set
+        if (ppm && obj.edges) {
+          obj.edges.forEach((edge, idx) => {
+            if (edge.realLength) {
+              const midX = ((edge.start.x + edge.end.x) / 2) * scale;
+              const midY = ((edge.start.y + edge.end.y) / 2) * scale;
+              
+              ctx.fillStyle = '#FFFFFF';
+              ctx.strokeStyle = '#000000';
+              ctx.lineWidth = 3;
+              ctx.font = 'bold 11px sans-serif';
+              const text = `${edge.realLength.toFixed(1)}mm`;
+              const metrics = ctx.measureText(text);
+              const textWidth = metrics.width;
+              const textHeight = 12;
+              
+              // Draw text background
+              ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+              ctx.fillRect(midX - textWidth / 2 - 3, midY - textHeight - 3, textWidth + 6, textHeight + 6);
+              
+              // Draw text
+              ctx.fillStyle = '#FFFFFF';
+              ctx.fillText(text, midX - textWidth / 2, midY - 2);
+            }
+          });
+        }
+
+        // Highlight selected
+        if (isSelected) {
+          ctx.strokeStyle = '#FFFFFF';
+          ctx.lineWidth = 4;
+          ctx.stroke();
+        }
+      } else {
+        // Fallback to bounding box
+        const { x, y, width, height } = obj.contour;
+        ctx.fillStyle = obj.color + '40';
+        ctx.fillRect(x * scale, y * scale, width * scale, height * scale);
+        ctx.strokeStyle = obj.color;
+        ctx.lineWidth = isSelected ? 3 : 2;
+        ctx.strokeRect(x * scale, y * scale, width * scale, height * scale);
+      }
+
+      // Draw label
+      const labelX = obj.contour.x * scale + 5;
+      const labelY = obj.contour.y * scale + 20;
+      
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillRect(labelX - 3, labelY - 14, ctx.measureText(obj.name).width + 6, 18);
+      
+      ctx.fillStyle = obj.color;
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillText(obj.name, labelX, labelY);
+
+      // Draw perimeter measurement if available
+      if (obj.measurements && obj.measurements.perimeter) {
+        const perimeterText = `Perimeter: ${obj.measurements.perimeter.toFixed(1)}mm`;
+        const perimeterX = obj.contour.x * scale + 5;
+        const perimeterY = (obj.contour.y + obj.contour.height) * scale - 5;
+        
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+        const pMetrics = ctx.measureText(perimeterText);
+        ctx.fillRect(perimeterX - 3, perimeterY - 12, pMetrics.width + 6, 16);
+        
+        ctx.fillStyle = '#FFFFFF';
+        ctx.font = '12px sans-serif';
+        ctx.fillText(perimeterText, perimeterX, perimeterY);
+      }
+    });
+
+    // Draw manual coin calibration line
+    if (mode === 'manual_coin' && coinPoints.length > 0) {
+      coinPoints.forEach((point, index) => {
+        const x = point.x * scale;
+        const y = point.y * scale;
+        
+        ctx.fillStyle = '#F59E0B';
+        ctx.beginPath();
+        ctx.arc(x, y, 8, 0, 2 * Math.PI);
+        ctx.fill();
+        
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        
+        if (coinPoints.length === 2 && index === 0) {
+          const point2 = coinPoints[1];
+          const x2 = point2.x * scale;
+          const y2 = point2.y * scale;
+          
+          ctx.strokeStyle = '#F59E0B';
+          ctx.lineWidth = 3;
+          ctx.setLineDash([5, 5]);
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          
+          const midX = (x + x2) / 2;
+          const midY = (y + y2) / 2;
+          const distance = calculatePixelDistance(point, point2);
+          ctx.fillStyle = '#FFFFFF';
+          ctx.font = 'bold 14px sans-serif';
+          ctx.fillText(`${distance.toFixed(1)}px`, midX + 10, midY - 10);
+        }
+      });
+    }
+
+    // Draw new object points being created
+    if (mode === 'create_object' && newObjectPoints.length > 0) {
+      ctx.strokeStyle = '#00FF00';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([5, 5]);
+      ctx.beginPath();
+      
+      newObjectPoints.forEach((point, index) => {
+        const x = point.x * scale;
+        const y = point.y * scale;
+        
+        if (index === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+        
+        // Draw point
+        ctx.fillStyle = '#00FF00';
+        ctx.beginPath();
+        ctx.arc(x, y, 5, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.strokeStyle = '#FFFFFF';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.strokeStyle = '#00FF00';
+        ctx.lineWidth = 2;
+      });
+      
+      // Draw line back to first point if more than 2 points
+      if (newObjectPoints.length > 2) {
+        const firstPoint = newObjectPoints[0];
+        const lastPoint = newObjectPoints[newObjectPoints.length - 1];
+        ctx.lineTo(firstPoint.x * scale, firstPoint.y * scale);
+      }
+      
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }, [imageSrc, objects, selectedObjectId, coinPoints, mode, canvasScale, newObjectPoints, ppm]);
+
+  const selectedObject = objects.find(obj => obj.id === selectedObjectId);
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white">
+      {/* Header */}
+      <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
+        <div className="flex items-center justify-between">
+          <h1 className="text-2xl font-bold text-white">BOB - Baseline Object Broker - Measurement Tool</h1>
+          <div className="flex items-center gap-3">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleImageUpload}
+              className="hidden"
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors font-medium"
+            >
+              Upload Image
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Content */}
+      <div className="flex h-[calc(100vh-80px)]">
+        {/* Left Panel - Image/Canvas */}
+        <div className="flex-1 p-4 overflow-auto bg-gray-800">
+          <div className="flex flex-col items-center">
+            {!imageSrc ? (
+              <div className="flex items-center justify-center h-full text-gray-400">
+                <div className="text-center">
+                  <p className="text-xl mb-4">Upload an image to get started</p>
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="px-6 py-3 bg-blue-600 hover:bg-blue-700 rounded-lg transition"
+                  >
+                    Choose Image
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <>
+                {/* Mode Toggle Buttons */}
+                <div className="mb-4 flex gap-2 flex-wrap justify-center">
+                  <button
+                    onClick={() => {
+                      setMode('select');
+                      setNewObjectPoints([]);
+                      setCoinPoints([]);
+                    }}
+                    className={`px-4 py-2 rounded-lg transition ${
+                      mode === 'select'
+                        ? 'bg-blue-600 text-white'
+                        : 'bg-gray-700 hover:bg-gray-600'
+                    }`}
+                  >
+                    Select
+                  </button>
+                  <button
+                    onClick={handleAutoCalibrate}
+                    disabled={isProcessing}
+                    className={`px-4 py-2 rounded-lg transition ${
+                      isProcessing
+                        ? 'bg-green-600 text-white'
+                        : 'bg-gray-700 hover:bg-gray-600'
+                    } ${isProcessing ? 'opacity-50 cursor-not-allowed' : ''}`}
+                  >
+                    {isProcessing ? 'Processing...' : 'Auto Detect Coin'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMode('manual_coin');
+                      setCoinPoints([]);
+                      setNewObjectPoints([]);
+                    }}
+                    className={`px-4 py-2 rounded-lg transition ${
+                      mode === 'manual_coin'
+                        ? 'bg-yellow-600 text-white'
+                        : 'bg-gray-700 hover:bg-gray-600'
+                    }`}
+                  >
+                    Manual Coin Calibration
+                  </button>
+                  <button
+                    onClick={() => {
+                      setMode('create_object');
+                      setNewObjectPoints([]);
+                      setCoinPoints([]);
+                    }}
+                    className={`px-4 py-2 rounded-lg transition ${
+                      mode === 'create_object'
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-gray-700 hover:bg-gray-600'
+                    }`}
+                  >
+                    Create Object
+                  </button>
+                  {mode === 'create_object' && newObjectPoints.length > 0 && (
+                    <button
+                      onClick={() => finishCreatingObject(newObjectPoints)}
+                      className="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg transition"
+                    >
+                      Finish ({newObjectPoints.length} points)
+                    </button>
+                  )}
+                </div>
+
+                {/* Canvas */}
+                <div className="border-2 border-gray-600 rounded-lg overflow-hidden">
+                  <canvas
+                    ref={canvasRef}
+                    onClick={handleCanvasClick}
+                    className={`bg-gray-900 ${
+                      mode === 'manual_coin' || mode === 'create_object' ? 'cursor-crosshair' : 
+                      mode === 'select' ? 'cursor-pointer' : 
+                      'cursor-default'
+                    }`}
+                    style={{ maxWidth: '100%', height: 'auto' }}
+                  />
+                </div>
+
+                {/* Mode Instructions */}
+                <div className="mt-4 text-sm text-gray-400 text-center">
+                  {mode === 'select' && 'Click on objects to select them'}
+                  {mode === 'auto_coin' && 'Click "Auto Detect Coin" to automatically calibrate'}
+                  {mode === 'manual_coin' && 'Click two points on the coin edge to measure its diameter'}
+                  {mode === 'create_object' && 'Click vertices to create a new object. Click near the first point to finish.'}
+                </div>
+
+                {ppm && (
+                  <div className="mt-2 text-green-400">
+                    Calibration: {ppm.toFixed(2)} pixels/mm (Coin: 26.5mm)
+                  </div>
+                )}
+
+                {isProcessing && (
+                  <div className="mt-2 text-blue-400">
+                    Processing image...
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Right Panel - Controls/Data */}
+        <div className="w-80 bg-gray-800 border-l border-gray-700 p-4 overflow-y-auto">
+          <h2 className="text-xl font-bold mb-4">Objects</h2>
+
+          {objects.length === 0 ? (
+            <p className="text-gray-400">No objects detected yet. Upload an image to begin.</p>
+          ) : (
+            <div className="space-y-4">
+              {objects.map(obj => (
+                <div
+                  key={obj.id}
+                  onClick={() => setSelectedObjectId(obj.id)}
+                  className={`p-3 rounded-lg border-2 cursor-pointer transition ${
+                    obj.id === selectedObjectId
+                      ? 'border-blue-500 bg-blue-900/30'
+                      : 'border-gray-700 hover:border-gray-600'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 mb-2">
+                    <div
+                      className="w-4 h-4 rounded"
+                      style={{ backgroundColor: obj.color }}
+                    />
+                    <span className="font-semibold">{obj.name}</span>
+                  </div>
+                  {obj.measurements && obj.measurements.perimeter ? (
+                    <div className="text-sm text-gray-300">
+                      Perimeter: {obj.measurements.perimeter.toFixed(1)}mm
+                    </div>
+                  ) : (
+                    <div className="text-sm text-gray-500">No measurements</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Selected Object Details */}
+          {selectedObject && (
+            <div className="mt-6 p-4 bg-gray-700 rounded-lg">
+              <h3 className="text-lg font-bold mb-3">Edit Object</h3>
+              
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Name</label>
+                  <input
+                    type="text"
+                    value={selectedObject.name}
+                    onChange={(e) => handleNameChange(selectedObject.id, e.target.value)}
+                    className="w-full px-3 py-2 bg-gray-600 rounded border border-gray-500 focus:outline-none focus:border-blue-500 text-white"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium mb-1">Color</label>
+                  <input
+                    type="color"
+                    value={selectedObject.color}
+                    onChange={(e) => handleColorChange(selectedObject.id, e.target.value)}
+                    className="w-full h-10 rounded cursor-pointer"
+                  />
+                </div>
+
+                {selectedObject.edges && selectedObject.edges.length > 0 && (
+      <div>
+                    <label className="block text-sm font-medium mb-2">Edge Measurements</label>
+                    <div className="space-y-1 max-h-40 overflow-y-auto">
+                      {selectedObject.edges.map((edge, idx) => (
+                        <div key={idx} className="text-sm bg-gray-600 p-2 rounded">
+                          <div className="flex justify-between">
+                            <span>Edge {idx + 1}:</span>
+                            <span className="font-mono">
+                              {edge.realLength !== null 
+                                ? `${edge.realLength.toFixed(2)}mm` 
+                                : `${edge.pixelLength.toFixed(1)}px`}
+                            </span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {selectedObject.measurements && selectedObject.measurements.perimeter && (
+                  <div className="text-sm text-green-400 bg-gray-600 p-2 rounded">
+                    Total Perimeter: {selectedObject.measurements.perimeter.toFixed(2)}mm
+                  </div>
+                )}
+
+                {!ppm && (
+                  <div className="text-yellow-400 text-sm">
+                    Tip: Calibrate using the coin to enable real-world measurements
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+      </div>
+  );
+}
+
+export default App;
