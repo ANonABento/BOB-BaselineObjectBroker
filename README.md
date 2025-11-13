@@ -10,6 +10,8 @@ A powerful client-side web application designed to calculate real-world dimensio
 
 The **BOB - Measurement Tool** establishes a **Pixels Per Millimeter (PPM)** scale factor using a known reference object (a **\$1 coin** with a 26.5 mm diameter). Once calibrated, this scale is instantly applied to all other detected objects, providing accurate real-world dimensions.
 
+<img width="1919" height="992" alt="image" src="https://github.com/user-attachments/assets/5abb865a-e9e3-4934-8cd4-06a3ef790a82" />
+
 ---
 
 ## ✨ Key Features
